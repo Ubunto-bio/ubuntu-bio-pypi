@@ -99,3 +99,40 @@ def test_upload_folder_preflight_blocks_human_data_samples(tmp_path: Path) -> No
             folder_path=folder,
             token="ubp_test_token",
         )
+
+
+def test_upload_file_skips_put_when_cas_deduplicated(tmp_path: Path) -> None:
+    """When LFS batch omits upload action due to CAS hit, skip PUT and commit directly."""
+    sample_file = tmp_path / "repeat.fasta"
+    sample_file.write_text(">seq1\nATGCGATC\n")
+
+    pre_resp = MagicMock()
+    pre_resp.status_code = 200
+    pre_resp.json.return_value = {
+        "repo_slug": "pasteur/lassa",
+        "cas_url": "http://localhost:8000",
+        "cas_write_token": "mock_cas_jwt_token",
+    }
+
+    batch_resp = MagicMock()
+    batch_resp.status_code = 200
+    batch_resp.json.return_value = {
+        "transfer": "basic",
+        "objects": [{"oid": "mock_oid", "actions": None}],
+    }
+
+    commit_resp = MagicMock()
+    commit_resp.status_code = 201
+    commit_resp.json.return_value = {"status": "committed", "repo_slug": "pasteur/lassa"}
+
+    with patch("httpx.post") as mock_post, patch("httpx.put") as mock_put:
+        mock_post.side_effect = [pre_resp, batch_resp, commit_resp]
+        res = upload_file(
+            repo_id="pasteur/lassa",
+            path_or_bytes=sample_file,
+            path_in_repo="assemblies/repeat.fasta",
+            token="ubp_test_token",
+        )
+        assert res["status"] == "committed"
+        assert mock_put.call_count == 0
+        assert mock_post.call_count == 3

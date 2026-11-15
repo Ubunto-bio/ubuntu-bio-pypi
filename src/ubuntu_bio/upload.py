@@ -148,27 +148,30 @@ def upload_file(
 
     batch_data = batch_resp.json()
     obj_data = batch_data["objects"][0]
-    upload_action = obj_data["actions"]["upload"]
-    upload_url = upload_action["href"]
-    upload_headers = upload_action.get("header", {})
-    if "Authorization" not in upload_headers:
-        upload_headers["Authorization"] = f"Bearer {cas_token}"
+    actions = obj_data.get("actions") or {}
+    upload_action = actions.get("upload")
 
-    # 3. Stream/PUT file content
-    try:
-        put_resp = httpx.put(
-            upload_url,
-            content=content,
-            headers=upload_headers,
-            timeout=60.0,
-        )
-    except httpx.RequestError as exc:
-        raise UploadError(f"Connection error transferring object payload: {exc}") from exc
+    # 3. Stream/PUT file content unless CAS deduplication short-circuited the upload
+    if upload_action:
+        upload_url = upload_action["href"]
+        upload_headers = dict(upload_action.get("header", {}))
+        if "Authorization" not in upload_headers:
+            upload_headers["Authorization"] = f"Bearer {cas_token}"
 
-    if put_resp.status_code not in (200, 201):
-        raise UploadError(
-            f"Object upload transfer failed (status {put_resp.status_code}): {put_resp.text}"
-        )
+        try:
+            put_resp = httpx.put(
+                upload_url,
+                content=content,
+                headers=upload_headers,
+                timeout=60.0,
+            )
+        except httpx.RequestError as exc:
+            raise UploadError(f"Connection error transferring object payload: {exc}") from exc
+
+        if put_resp.status_code not in (200, 201):
+            raise UploadError(
+                f"Object upload transfer failed (status {put_resp.status_code}): {put_resp.text}"
+            )
 
     # 4. Finalize commit on hub
     commit_payload = {
