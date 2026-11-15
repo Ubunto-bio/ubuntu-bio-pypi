@@ -26,7 +26,7 @@ from ubuntu_bio.sniffer import SequenceSniffResult, sniff_sequence_file
 from ubuntu_bio.upload import upload_file, upload_folder
 from ubuntu_bio.validator import ValidationIssue, ValidationResult, validate_local_dataset
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "AuthenticationError",

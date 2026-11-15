@@ -1,5 +1,6 @@
 """Unit tests for UbuntuBio CLI commands (T-CLI-09)."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 from typer.testing import CliRunner
@@ -13,7 +14,7 @@ def test_cli_version() -> None:
     """Test ubio --version prints version string."""
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "UbuntuBio CLI version: 0.1.0" in result.stdout
+    assert "UbuntuBio CLI version: 1.0.0" in result.stdout
 
 
 def test_cli_whoami_success() -> None:
@@ -145,7 +146,7 @@ def test_cli_search() -> None:
         assert "pasteur/cholera-2024" in result.stdout
 
 
-def test_cli_push_alias(tmp_path) -> None:
+def test_cli_push_alias(tmp_path: Path) -> None:
     """Test ubio push acts as an alias for upload."""
     sample_file = tmp_path / "data.fasta"
     sample_file.write_text(">seq1\nACGT")
