@@ -10,11 +10,12 @@ from __future__ import annotations
 import gzip
 import io
 import logging
+import random
 import zlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from ubuntu_bio.constants import (
     BAM_MAGIC,
@@ -28,6 +29,8 @@ from ubuntu_bio.validator import ValidationIssue
 logger = logging.getLogger("ubuntu_bio.sniffer")
 
 KMER_SIZE: Final[int] = 25
+SamplingMode = Literal["head", "multi_window", "full"]
+HumanScreenPolicy = Literal["warn", "strict_reject"]
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,8 @@ class SequenceSniffResult:
     n_base_percent: float = 0.0
     phred_encoding: str = "UNKNOWN"  # "Phred+33", "Phred+64", "UNKNOWN"
     human_markers_detected: bool = False
+    human_marker_hits: int = 0
+    sampling_mode: str = "multi_window"
     issues: list[ValidationIssue] = field(default_factory=list)
 
     @property
@@ -65,9 +70,12 @@ def _extract_kmers(seq: str, k: int = KMER_SIZE) -> set[str]:
 
 
 def _has_human_marker(seq_upper: str) -> bool:
-    """Check if sequence matches any canonical human rRNA/mtDNA k-mer marker."""
-    kmers = _extract_kmers(seq_upper, KMER_SIZE)
-    return bool(kmers.intersection(HUMAN_SIGNATURE_KMERS))
+    """Return True if any 25-mer in seq_upper matches the curated human reference panel."""
+    limit = len(seq_upper) - KMER_SIZE + 1
+    if limit <= 0:
+        return False
+    kmers = HUMAN_SIGNATURE_KMERS
+    return any(seq_upper[i : i + KMER_SIZE] in kmers for i in range(limit))
 
 
 def sniff_magic_bytes(file_path: Path) -> tuple[str, str, bytes]:
@@ -111,8 +119,15 @@ def sniff_fastq_stream(
     file_str: str,
     compression: str,
     max_reads: int = 2000,
+    sampling_mode: SamplingMode = "multi_window",
+    human_screen_policy: HumanScreenPolicy = "warn",
+    max_scan_records: int = 250_000,
 ) -> SequenceSniffResult:
-    """Screen FASTQ stream records for 4-line structure, quality encoding, and metrics."""
+    """Screen FASTQ records for syntax integrity, QC metrics, and human-signature markers.
+
+    In ``multi_window`` mode, inspects the initial ``head_quota`` reads sequentially and applies
+    deterministic reservoir sampling across up to ``max_scan_records`` subsequent records.
+    """
     issues: list[ValidationIssue] = []
     reads_sampled = 0
     total_length = 0
@@ -124,11 +139,63 @@ def sniff_fastq_stream(
     min_q_ascii = 127
     max_q_ascii = 0
     human_marker_hits = 0
+    header_human_detected = False
+
+    head_quota = max_reads if sampling_mode == "head" else max(1, max_reads // 2)
+    reservoir_cap = 0 if sampling_mode == "head" else max(0, max_reads - head_quota)
+    reservoir: list[tuple[int, str, str, str]] = []
+    rng = random.Random(42)  # noqa: S311 - deterministic reservoir sampling order
 
     it = iter(stream)
     line_num = 0
+    records_seen = 0
+    stream_limit = (
+        max_reads
+        if sampling_mode == "head"
+        else (None if sampling_mode == "full" else max_scan_records)
+    )
 
-    while reads_sampled < max_reads:
+    def _accumulate_record(header_line: str, seq: str, qual: str, hdr_line_num: int) -> None:
+        nonlocal reads_sampled, total_length, min_len, max_len
+        nonlocal gc_count, n_count, total_bases, min_q_ascii, max_q_ascii
+        nonlocal human_marker_hits, header_human_detected
+
+        if HUMAN_HEADER_REGEX.search(header_line):
+            header_human_detected = True
+            issues.append(
+                ValidationIssue(
+                    file=file_str,
+                    line=hdr_line_num,
+                    column="header",
+                    message=(
+                        f"Human chromosome/assembly indicator detected in FASTQ header: "
+                        f"'{header_line[:50]}'. Human genomic data is prohibited in v1."
+                    ),
+                )
+            )
+
+        reads_sampled += 1
+        seq_len = len(seq)
+        total_length += seq_len
+        min_len = seq_len if min_len == 0 else min(min_len, seq_len)
+        max_len = max(max_len, seq_len)
+
+        seq_upper = seq.upper()
+        gc_count += seq_upper.count("G") + seq_upper.count("C")
+        n_count += seq_upper.count("N")
+        total_bases += seq_len
+
+        for char in qual:
+            ascii_val = ord(char)
+            if ascii_val < min_q_ascii:
+                min_q_ascii = ascii_val
+            if ascii_val > max_q_ascii:
+                max_q_ascii = ascii_val
+
+        if _has_human_marker(seq_upper):
+            human_marker_hits += 1
+
+    while stream_limit is None or records_seen < stream_limit:
         try:
             line1 = next(it, None)
             if line1 is None:
@@ -145,28 +212,13 @@ def sniff_fastq_stream(
                         file=file_str,
                         line=line_num,
                         message=(
-                            f"FASTQ record #{reads_sampled + 1} header line must begin with '@', "
+                            f"FASTQ record #{records_seen + 1} header line must begin with '@', "
                             f"got '{line1[:30]}'."
                         ),
                     )
                 )
                 break
 
-            # Check header for human indicators
-            if HUMAN_HEADER_REGEX.search(line1):
-                issues.append(
-                    ValidationIssue(
-                        file=file_str,
-                        line=line_num,
-                        column="header",
-                        message=(
-                            f"Human chromosome/assembly indicator detected in FASTQ header: "
-                            f"'{line1[:50]}'. Human genomic data is prohibited in v1."
-                        ),
-                    )
-                )
-
-            # Line 2: Sequence
             line2 = next(it, None)
             if line2 is None:
                 issues.append(
@@ -174,7 +226,7 @@ def sniff_fastq_stream(
                         file=file_str,
                         line=line_num + 1,
                         message=(
-                            f"Premature EOF in FASTQ record #{reads_sampled + 1} "
+                            f"Premature EOF in FASTQ record #{records_seen + 1} "
                             "(sequence line missing)."
                         ),
                     )
@@ -184,7 +236,6 @@ def sniff_fastq_stream(
             seq = line2.strip()
             seq_len = len(seq)
 
-            # Line 3: Separator (+)
             line3 = next(it, None)
             if line3 is None:
                 issues.append(
@@ -192,7 +243,7 @@ def sniff_fastq_stream(
                         file=file_str,
                         line=line_num + 1,
                         message=(
-                            f"Premature EOF in FASTQ record #{reads_sampled + 1} "
+                            f"Premature EOF in FASTQ record #{records_seen + 1} "
                             "(separator line missing)."
                         ),
                     )
@@ -206,14 +257,13 @@ def sniff_fastq_stream(
                         file=file_str,
                         line=line_num,
                         message=(
-                            f"FASTQ record #{reads_sampled + 1} separator line "
+                            f"FASTQ record #{records_seen + 1} separator line "
                             f"must begin with '+', got '{sep[:20]}'."
                         ),
                     )
                 )
                 break
 
-            # Line 4: Quality string
             line4 = next(it, None)
             if line4 is None:
                 issues.append(
@@ -221,7 +271,7 @@ def sniff_fastq_stream(
                         file=file_str,
                         line=line_num + 1,
                         message=(
-                            f"Premature EOF in FASTQ record #{reads_sampled + 1} "
+                            f"Premature EOF in FASTQ record #{records_seen + 1} "
                             "(quality line missing)."
                         ),
                     )
@@ -237,33 +287,26 @@ def sniff_fastq_stream(
                         line=line_num,
                         column="quality",
                         message=(
-                            f"FASTQ record #{reads_sampled + 1} length mismatch: "
+                            f"FASTQ record #{records_seen + 1} length mismatch: "
                             f"sequence length ({seq_len}) != quality length ({len(qual)})."
                         ),
                     )
                 )
                 break
 
-            # Accumulate metrics
-            reads_sampled += 1
-            total_length += seq_len
-            min_len = seq_len if min_len == 0 else min(min_len, seq_len)
-            max_len = max(max_len, seq_len)
+            records_seen += 1
+            hdr_line_num = line_num - 3
 
-            seq_upper = seq.upper()
-            gc_count += seq_upper.count("G") + seq_upper.count("C")
-            n_count += seq_upper.count("N")
-            total_bases += seq_len
-
-            # Check quality scores
-            for char in qual:
-                ascii_val = ord(char)
-                min_q_ascii = min(min_q_ascii, ascii_val)
-                max_q_ascii = max(max_q_ascii, ascii_val)
-
-            # Screen for human markers
-            if _has_human_marker(seq_upper):
-                human_marker_hits += 1
+            if sampling_mode != "multi_window" or records_seen <= head_quota:
+                _accumulate_record(line1, seq, qual, hdr_line_num)
+            elif reservoir_cap > 0:
+                idx_after_head = records_seen - head_quota
+                if len(reservoir) < reservoir_cap:
+                    reservoir.append((hdr_line_num, line1, seq, qual))
+                else:
+                    slot = rng.randrange(idx_after_head)
+                    if slot < reservoir_cap:
+                        reservoir[slot] = (hdr_line_num, line1, seq, qual)
 
         except Exception as exc:
             logger.error("Error reading FASTQ record in '%s': %s", file_str, exc)
@@ -276,6 +319,9 @@ def sniff_fastq_stream(
             )
             break
 
+    for hdr_line_num, line1, seq, qual in reservoir:
+        _accumulate_record(line1, seq, qual, hdr_line_num)
+
     if reads_sampled == 0 and not issues:
         issues.append(
             ValidationIssue(
@@ -284,7 +330,6 @@ def sniff_fastq_stream(
             )
         )
 
-    # Determine Phred scale
     phred_scale = "UNKNOWN"
     if reads_sampled > 0:
         if min_q_ascii < 58:
@@ -305,12 +350,10 @@ def sniff_fastq_stream(
         else:
             phred_scale = "Phred+33"
 
-    # Metric calculations
     mean_len = (total_length / reads_sampled) if reads_sampled > 0 else 0.0
     gc_pct = (gc_count / total_bases * 100.0) if total_bases > 0 else 0.0
     n_pct = (n_count / total_bases * 100.0) if total_bases > 0 else 0.0
 
-    # N-base warning
     if n_pct > 15.0:
         issues.append(
             ValidationIssue(
@@ -323,21 +366,21 @@ def sniff_fastq_stream(
             )
         )
 
-    # Human marker contamination check
-    human_detected = False
-    if reads_sampled >= 10 and (human_marker_hits / reads_sampled) >= 0.20:
-        human_detected = True
+    human_detected = header_human_detected or (human_marker_hits > 0)
+    if human_marker_hits > 0:
         pct_hit = (human_marker_hits / reads_sampled) * 100.0
+        severity_lvl: Literal["error", "warning"] = (
+            "error" if human_screen_policy == "strict_reject" else "warning"
+        )
         issues.append(
             ValidationIssue(
                 file=file_str,
                 message=(
-                    f"Potential undepleted human host contamination detected: "
-                    f"{human_marker_hits}/{reads_sampled} sampled reads ({pct_hit:.1f}%) "
-                    "matched human rRNA/mtDNA marker signatures. Human genomic data is "
-                    "prohibited in UbuntuBio v1."
+                    f"Potential undepleted human host contamination detected via k-mer screen "
+                    f"({human_marker_hits}/{reads_sampled} inspected reads, {pct_hit:.2f}%). "
+                    "Verify upstream host depletion (e.g., Hostile) prior to release."
                 ),
-                severity="warning",
+                severity=severity_lvl,
             )
         )
 
@@ -356,6 +399,8 @@ def sniff_fastq_stream(
         n_base_percent=round(n_pct, 2),
         phred_encoding=phred_scale,
         human_markers_detected=human_detected,
+        human_marker_hits=human_marker_hits,
+        sampling_mode=sampling_mode,
         issues=issues,
     )
 
@@ -365,6 +410,8 @@ def sniff_fasta_stream(
     file_str: str,
     compression: str,
     max_records: int = 2000,
+    sampling_mode: SamplingMode = "multi_window",
+    human_screen_policy: HumanScreenPolicy = "warn",
 ) -> SequenceSniffResult:
     """Screen FASTA stream records for contig headers, length, GC%, and human assembly markers."""
     issues: list[ValidationIssue] = []
@@ -376,6 +423,7 @@ def sniff_fasta_stream(
     n_count = 0
     total_bases = 0
     human_detected = False
+    human_marker_hits = 0
 
     current_header = ""
     current_seq_parts: list[str] = []
@@ -383,7 +431,7 @@ def sniff_fasta_stream(
 
     def _flush_record(header: str, seq_str: str, rec_idx: int) -> None:
         nonlocal records_sampled, total_length, min_len, max_len
-        nonlocal gc_count, n_count, total_bases, human_detected
+        nonlocal gc_count, n_count, total_bases, human_detected, human_marker_hits
 
         if not header:
             return
@@ -416,6 +464,7 @@ def sniff_fasta_stream(
 
         if _has_human_marker(seq_upper):
             human_detected = True
+            human_marker_hits += 1
 
     for line in stream:
         line_num += 1
@@ -427,7 +476,7 @@ def sniff_fasta_stream(
             if current_header:
                 _flush_record(current_header, "".join(current_seq_parts), line_num)
                 current_seq_parts.clear()
-                if records_sampled >= max_records:
+                if sampling_mode != "full" and records_sampled >= max_records:
                     break
             current_header = stripped[1:].strip()
             if not current_header:
@@ -450,7 +499,7 @@ def sniff_fasta_stream(
                 break
             current_seq_parts.append(stripped)
 
-    if current_header and records_sampled < max_records:
+    if current_header and (sampling_mode == "full" or records_sampled < max_records):
         _flush_record(current_header, "".join(current_seq_parts), line_num)
 
     if records_sampled == 0 and not issues:
@@ -458,6 +507,21 @@ def sniff_fasta_stream(
             ValidationIssue(
                 file=file_str,
                 message="FASTA file contains no valid sequence records.",
+            )
+        )
+
+    if human_marker_hits > 0:
+        severity_lvl: Literal["error", "warning"] = (
+            "error" if human_screen_policy == "strict_reject" else "warning"
+        )
+        issues.append(
+            ValidationIssue(
+                file=file_str,
+                message=(
+                    f"Human reference k-mer signatures detected in {human_marker_hits}/"
+                    f"{records_sampled} inspected FASTA record(s)."
+                ),
+                severity=severity_lvl,
             )
         )
 
@@ -480,6 +544,8 @@ def sniff_fasta_stream(
         n_base_percent=round(n_pct, 2),
         phred_encoding="NONE",
         human_markers_detected=human_detected,
+        human_marker_hits=human_marker_hits,
+        sampling_mode=sampling_mode,
         issues=issues,
     )
 
@@ -559,7 +625,13 @@ def sniff_bam_file(file_path: Path) -> SequenceSniffResult:
     )
 
 
-def sniff_sequence_file(file_path: Path, max_reads: int = 2000) -> SequenceSniffResult:
+def sniff_sequence_file(
+    file_path: Path,
+    max_reads: int = 2000,
+    sampling_mode: SamplingMode = "multi_window",
+    human_screen_policy: HumanScreenPolicy = "warn",
+    max_scan_records: int = 250_000,
+) -> SequenceSniffResult:
     """Perform streaming biological sanity screening on a local sequence file.
 
     Inspects magic bytes, format structure (FASTQ/FASTA/BAM), Phred scale,
@@ -652,6 +724,9 @@ def sniff_sequence_file(file_path: Path, max_reads: int = 2000) -> SequenceSniff
                     file_str=file_str,
                     compression=compression,
                     max_reads=max_reads,
+                    sampling_mode=sampling_mode,
+                    human_screen_policy=human_screen_policy,
+                    max_scan_records=max_scan_records,
                 )
             elif first_line.startswith(">"):
                 return sniff_fasta_stream(
@@ -659,6 +734,8 @@ def sniff_sequence_file(file_path: Path, max_reads: int = 2000) -> SequenceSniff
                     file_str=file_str,
                     compression=compression,
                     max_records=max_reads,
+                    sampling_mode=sampling_mode,
+                    human_screen_policy=human_screen_policy,
                 )
             else:
                 return SequenceSniffResult(

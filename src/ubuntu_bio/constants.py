@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import gzip
 import re
+from pathlib import Path
 from typing import Final
 
-# 54 African Union (AU) member states (ISO-3166-1 alpha-2)
+# 55 African Union (AU) member states (ISO-3166-1 alpha-2, including EH)
 AU_COUNTRY_CODES: Final[frozenset[str]] = frozenset(
     {
         "DZ",
@@ -24,6 +26,7 @@ AU_COUNTRY_CODES: Final[frozenset[str]] = frozenset(
         "CI",
         "DJ",
         "EG",
+        "EH",
         "GQ",
         "ER",
         "SZ",
@@ -88,6 +91,10 @@ VALID_ACCESS_TIERS: Final[frozenset[str]] = frozenset(
         "private",
     }
 )
+
+# Permitted geospatial scope policies and human sequence screening modes
+VALID_GEO_POLICIES: Final[frozenset[str]] = frozenset({"au_strict", "allow_outgroups"})
+VALID_HUMAN_SCREEN_POLICIES: Final[frozenset[str]] = frozenset({"warn", "strict_reject"})
 
 # Permitted sequencing platforms
 VALID_PLATFORMS: Final[frozenset[str]] = frozenset(
@@ -176,20 +183,27 @@ HUMAN_HEADER_REGEX: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
-# Canonical 25-mer markers for human rRNA (18S/28S) and mitochondrial hypervariable DNA
-HUMAN_SIGNATURE_KMERS: Final[frozenset[str]] = frozenset(
-    {
-        "CGCGACCTCAGATCAGACGTGGCGA",
-        "TGCCAGTAGCATATGCTTGTCTCAA",
-        "AGACCTGGCGCTGCGCTTGCTTGGT",
-        "GCTGCGCTTGCTTGGTTCGTTGGCG",
-        "GTAACCCGTTGAACCCCATTCGTGA",
-        "AGGAATTGACGGAAGGGCACCACCA",
-        "TCCTGCCAGTAGCATATGCTTGTCT",
-        "GATCACAGGTCTATCACCCTATTAA",
-        "TAGACGGGCTCACATCACCCCATAA",
-        "ACCCTATTAACCACTCACGGGAGCT",
-        "CTCCGGGCGCTGCGGTTTCCGGCGC",
-        "CCCTCGGGGCCTCCGGCGGAGGGCT",
-    }
-)
+
+# Curated strand-specific 25-mer panel tiled across human mtDNA (NC_012920.1),
+# 18S rRNA (NR_003286.4), 28S rRNA (NR_003287.4), and AluY (U14574.1) after subtracting
+# cross-kingdom bacterial, viral, and protozoan pathogen 25-mers.
+def _load_human_kmers() -> frozenset[str]:
+    kmer_path = Path(__file__).with_name("human_kmers.txt.gz")
+    if kmer_path.exists():
+        lines = gzip.decompress(kmer_path.read_bytes()).decode("utf-8").splitlines()
+        return frozenset(line.strip().upper() for line in lines if line.strip())
+    return frozenset(
+        {
+            "CGCGACCTCAGATCAGACGTGGCGA",
+            "TGCCAGTAGCATATGCTTGTCTCAA",
+            "GTAACCCGTTGAACCCCATTCGTGA",
+            "AGGAATTGACGGAAGGGCACCACCA",
+            "TCCTGCCAGTAGCATATGCTTGTCT",
+            "GATCACAGGTCTATCACCCTATTAA",
+            "TAGACGGGCTCACATCACCCCATAA",
+            "ACCCTATTAACCACTCACGGGAGCT",
+        }
+    )
+
+
+HUMAN_SIGNATURE_KMERS: Final[frozenset[str]] = _load_human_kmers()

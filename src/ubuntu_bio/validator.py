@@ -12,20 +12,19 @@ from typing import Any
 import yaml
 
 from ubuntu_bio.constants import (
-    AFRICA_LAT_MAX,
-    AFRICA_LAT_MIN,
-    AFRICA_LON_MAX,
-    AFRICA_LON_MIN,
     AU_COUNTRY_CODES,
     MANDATORY_SAMPLE_COLUMNS,
     PROHIBITED_TAXA,
     SEQUENCE_FILE_EXTENSIONS,
     VALID_DOMAINS,
     VALID_FILE_TYPES,
+    VALID_GEO_POLICIES,
+    VALID_HUMAN_SCREEN_POLICIES,
     VALID_LAYOUTS,
     VALID_PLATFORMS,
     VALID_STRATEGIES,
 )
+from ubuntu_bio.geospatial import is_point_in_au_country
 
 logger = logging.getLogger("ubuntu_bio.validator")
 
@@ -183,6 +182,33 @@ def _validate_frontmatter(fm: dict[str, Any]) -> list[ValidationIssue]:
             )
         )
 
+    # Policies: geo_policy ('au_strict' | 'allow_outgroups') & human_screen_policy
+    geo_policy = str(fm.get("geo_policy", "au_strict")).strip().lower()
+    if geo_policy not in VALID_GEO_POLICIES:
+        issues.append(
+            ValidationIssue(
+                file="README.md",
+                column="geo_policy",
+                message=(
+                    f"Invalid geo_policy '{geo_policy}'. Permitted: {sorted(VALID_GEO_POLICIES)}"
+                ),
+            )
+        )
+        geo_policy = "au_strict"
+
+    human_screen_policy = str(fm.get("human_screen_policy", "warn")).strip().lower()
+    if human_screen_policy not in VALID_HUMAN_SCREEN_POLICIES:
+        issues.append(
+            ValidationIssue(
+                file="README.md",
+                column="human_screen_policy",
+                message=(
+                    f"Invalid human_screen_policy '{human_screen_policy}'. "
+                    f"Permitted: {sorted(VALID_HUMAN_SCREEN_POLICIES)}"
+                ),
+            )
+        )
+
     # Countries
     countries = fm.get("countries")
     if not isinstance(countries, list) or not countries:
@@ -194,15 +220,41 @@ def _validate_frontmatter(fm: dict[str, Any]) -> list[ValidationIssue]:
             )
         )
     else:
-        for c in countries:
-            if not isinstance(c, str) or c.strip().upper() not in AU_COUNTRY_CODES:
+        normalized_countries = [str(c).strip().upper() for c in countries if isinstance(c, str)]
+        if geo_policy == "au_strict":
+            for c in countries:
+                if not isinstance(c, str) or c.strip().upper() not in AU_COUNTRY_CODES:
+                    issues.append(
+                        ValidationIssue(
+                            file="README.md",
+                            column="countries",
+                            message=(
+                                f"Country code '{c}' is not among the 55 "
+                                "African Union member states."
+                            ),
+                        )
+                    )
+        else:
+            if not any(code in AU_COUNTRY_CODES for code in normalized_countries):
                 issues.append(
                     ValidationIssue(
                         file="README.md",
                         column="countries",
-                        message=(f"Country code '{c}' is not an African Union member state."),
+                        message=(
+                            "When geo_policy='allow_outgroups', 'countries' must still declare "
+                            "at least one African Union member state."
+                        ),
                     )
                 )
+            for c in countries:
+                if not isinstance(c, str) or not re.fullmatch(r"[A-Za-z]{2}", c.strip()):
+                    issues.append(
+                        ValidationIssue(
+                            file="README.md",
+                            column="countries",
+                            message=f"Invalid ISO-3166-1 alpha-2 country code '{c}'.",
+                        )
+                    )
 
     # Taxon IDs
     taxon_ids = fm.get("taxon_ids")
@@ -513,10 +565,17 @@ def validate_local_dataset(folder_path: Path) -> ValidationResult:
                     )
 
                 card_countries = (
-                    set(frontmatter.get("countries", []))
+                    {str(c).strip().upper() for c in frontmatter.get("countries", [])}
                     if frontmatter and isinstance(frontmatter.get("countries"), list)
                     else None
                 )
+                geo_policy = (
+                    str(frontmatter.get("geo_policy", "au_strict")).strip().lower()
+                    if frontmatter
+                    else "au_strict"
+                )
+                if geo_policy not in VALID_GEO_POLICIES:
+                    geo_policy = "au_strict"
 
                 for line_num, row in enumerate(reader, start=2):
                     if not row or all(not cell.strip() for cell in row):
@@ -550,21 +609,34 @@ def validate_local_dataset(folder_path: Path) -> ValidationResult:
                         sample_ids.add(sid)
 
                     # Country check
+                    c_code = ""
                     if "country" in col_idx:
                         c_code = (
                             row[col_idx["country"]].strip().upper()
                             if col_idx["country"] < len(row)
                             else ""
                         )
-                        if c_code not in AU_COUNTRY_CODES:
+                        if geo_policy == "au_strict" and c_code not in AU_COUNTRY_CODES:
                             all_issues.append(
                                 ValidationIssue(
                                     file="samples.tsv",
                                     line=line_num,
                                     column="country",
                                     message=(
-                                        f"Sample country '{c_code}' is not an AU member state."
+                                        f"Sample country '{c_code}' is not among "
+                                        "the 55 AU member states."
                                     ),
+                                )
+                            )
+                        elif geo_policy == "allow_outgroups" and not re.fullmatch(
+                            r"[A-Z]{2}", c_code
+                        ):
+                            all_issues.append(
+                                ValidationIssue(
+                                    file="samples.tsv",
+                                    line=line_num,
+                                    column="country",
+                                    message=f"Invalid ISO-3166-1 alpha-2 country code '{c_code}'.",
                                 )
                             )
                         elif card_countries is not None and c_code not in card_countries:
@@ -631,7 +703,7 @@ def validate_local_dataset(folder_path: Path) -> ValidationResult:
                                 )
                             )
 
-                    # Geolocation check
+                    # Geolocation check (Natural Earth 1:50m country polygon + coastal buffer)
                     if "lat" in col_idx and "lon" in col_idx:
                         lat_raw = row[col_idx["lat"]].strip() if col_idx["lat"] < len(row) else ""
                         lon_raw = row[col_idx["lon"]].strip() if col_idx["lon"] < len(row) else ""
@@ -639,30 +711,44 @@ def validate_local_dataset(folder_path: Path) -> ValidationResult:
                             try:
                                 lat_f = float(lat_raw)
                                 lon_f = float(lon_raw)
-                                if not (AFRICA_LAT_MIN <= lat_f <= AFRICA_LAT_MAX):
+                                if not (-90.0 <= lat_f <= 90.0):
                                     all_issues.append(
                                         ValidationIssue(
                                             file="samples.tsv",
                                             line=line_num,
                                             column="lat",
                                             message=(
-                                                f"Latitude {lat_f} is outside African bounds "
-                                                f"[{AFRICA_LAT_MIN}, {AFRICA_LAT_MAX}]."
+                                                f"Latitude {lat_f} out of WGS-84 range [-90, 90]."
                                             ),
                                         )
                                     )
-                                if not (AFRICA_LON_MIN <= lon_f <= AFRICA_LON_MAX):
+                                elif not (-180.0 <= lon_f <= 180.0):
                                     all_issues.append(
                                         ValidationIssue(
                                             file="samples.tsv",
                                             line=line_num,
                                             column="lon",
                                             message=(
-                                                f"Longitude {lon_f} is outside African bounds "
-                                                f"[{AFRICA_LON_MIN}, {AFRICA_LON_MAX}]."
+                                                f"Longitude {lon_f} out of WGS-84 range "
+                                                "[-180, 180]."
                                             ),
                                         )
                                     )
+                                elif c_code in AU_COUNTRY_CODES:
+                                    ok_poly, poly_err = is_point_in_au_country(c_code, lat_f, lon_f)
+                                    if not ok_poly:
+                                        all_issues.append(
+                                            ValidationIssue(
+                                                file="samples.tsv",
+                                                line=line_num,
+                                                column="lat/lon",
+                                                message=(
+                                                    poly_err
+                                                    or f"Coordinates ({lat_f}, {lon_f}) outside "
+                                                    f"'{c_code}' boundary."
+                                                ),
+                                            )
+                                        )
                             except ValueError:
                                 all_issues.append(
                                     ValidationIssue(
@@ -815,7 +901,17 @@ def validate_local_dataset(folder_path: Path) -> ValidationResult:
                                 from ubuntu_bio.sniffer import sniff_sequence_file
 
                                 seq_path = folder_path / fn_clean
-                                sniff_res = sniff_sequence_file(seq_path)
+                                screen_policy = (
+                                    str(frontmatter.get("human_screen_policy", "warn"))
+                                    .strip()
+                                    .lower()
+                                )
+                                if screen_policy not in VALID_HUMAN_SCREEN_POLICIES:
+                                    screen_policy = "warn"
+                                sniff_res = sniff_sequence_file(
+                                    seq_path,
+                                    human_screen_policy=screen_policy,  # type: ignore[arg-type]
+                                )
                                 sniff_results.append(sniff_res)
                                 for issue in sniff_res.issues:
                                     all_issues.append(issue)

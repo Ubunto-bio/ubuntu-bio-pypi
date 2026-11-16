@@ -96,7 +96,7 @@ def test_init_dataset_prohibited_human_taxa(tmp_path: Path) -> None:
 def test_init_dataset_invalid_country(tmp_path: Path) -> None:
     """Test init_dataset rejects non-AU country codes."""
     target = tmp_path / "invalid_country"
-    with pytest.raises(ClientValidationError, match=r"must belong to the 54 African Union"):
+    with pytest.raises(ClientValidationError, match=r"must belong to the 55 African Union"):
         init_dataset(
             target_dir=target,
             title="Non-AU Dataset",
@@ -280,3 +280,55 @@ def test_cli_check_command_fail(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert "[FAILED] Dataset validation failed" in result.stdout
     assert "[ERROR]" in result.stdout
+
+
+def test_validate_au55_eh_lesotho_enclave_and_outgroups(tmp_path: Path) -> None:
+    """Verify 55 AU states (EH), Lesotho/South Africa hole check, and allow_outgroups."""
+    ds_eh = tmp_path / "eh_ds"
+    init_dataset(
+        target_dir=ds_eh,
+        title="Western Sahara Surveillance",
+        domain="bacteria",
+        country="EH",
+        taxon_id=562,
+    )
+    (ds_eh / "samples.tsv").write_text(
+        "sample_id\ttaxon_id\tcountry\tcollection_date\tlat\tlon\tadmin1\thost\tisolation_source\n"
+        "SMP_001\t562\tEH\t2025-01-10\t26.15\t-9.65\tBir Lehlou\tCamel\tfecal\n"
+        "SMP_002\t562\tEH\t2025-01-11\t26.158\t-10.567\tTifariti\tCamel\tfecal\n",
+        encoding="utf-8",
+    )
+    for s in ["SMP_001", "SMP_002"]:
+        (ds_eh / "reads" / f"{s}_1.fastq.gz").touch()
+        (ds_eh / "reads" / f"{s}_2.fastq.gz").touch()
+    assert validate_local_dataset(ds_eh).valid is True
+
+    # Maseru (-29.3167, 27.4833) is inside Lesotho, NOT South Africa
+    (ds_eh / "README.md").write_text(
+        (ds_eh / "README.md").read_text(encoding="utf-8").replace("[EH]", "[ZA]"),
+        encoding="utf-8",
+    )
+    (ds_eh / "samples.tsv").write_text(
+        "sample_id\ttaxon_id\tcountry\tcollection_date\tlat\tlon\tadmin1\thost\tisolation_source\n"
+        "SMP_001\t562\tZA\t2025-01-10\t-29.3167\t27.4833\tMaseru\tHuman\tblood\n",
+        encoding="utf-8",
+    )
+    res_enclave = validate_local_dataset(ds_eh)
+    assert res_enclave.valid is False
+    assert any("fall inside 'LS'" in e.message for e in res_enclave.errors)
+
+    # Comparative phylogeography with allow_outgroups accepts AU + US outgroup, still bans 9606
+    (ds_eh / "README.md").write_text(
+        (ds_eh / "README.md")
+        .read_text(encoding="utf-8")
+        .replace("[ZA]", "[KE, US]")
+        .replace("access: public", "access: public\ngeo_policy: allow_outgroups"),
+        encoding="utf-8",
+    )
+    (ds_eh / "samples.tsv").write_text(
+        "sample_id\ttaxon_id\tcountry\tcollection_date\tlat\tlon\tadmin1\thost\tisolation_source\n"
+        "SMP_001\t562\tKE\t2025-01-10\t-1.2921\t36.8219\tNairobi\tCow\tblood\n"
+        "SMP_002\t562\tUS\t2025-01-11\t38.9072\t-77.0369\tDC\tCow\tblood\n",
+        encoding="utf-8",
+    )
+    assert validate_local_dataset(ds_eh).valid is True

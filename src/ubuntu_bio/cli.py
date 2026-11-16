@@ -13,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from ubuntu_bio import __version__
+from ubuntu_bio.audit import fetch_and_verify_checkpoint
 from ubuntu_bio.auth import (
     LoopbackCallbackServer,
     find_free_port,
@@ -1000,6 +1001,53 @@ def check(
         raise typer.Exit(code=1)
     else:
         console.print("[bold green][PASSED] Dataset is valid and ready for upload.[/bold green]")
+
+
+audit_app = typer.Typer(
+    name="audit",
+    help="Export and verify RS256-signed repository audit checkpoints against external anchors.",
+    no_args_is_help=True,
+)
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command(name="checkpoint")
+def audit_checkpoint(
+    repo_id: Annotated[str, typer.Argument(help="Repository slug (e.g. 'org/repo').")],
+    save: Annotated[
+        Path | None,
+        typer.Option(
+            "--save",
+            help="Append verified checkpoint record to an external JSONL anchor ledger.",
+        ),
+    ] = None,
+    verify_against: Annotated[
+        Path | None,
+        typer.Option(
+            "--verify-against",
+            help="Verify consistency against a previously saved JSONL anchor ledger.",
+        ),
+    ] = None,
+) -> None:
+    """Fetch RS256-signed audit checkpoint and verify continuity against retained anchors."""
+    slug = resolve_repo_slug(repo_id, command_name="audit checkpoint")
+    try:
+        res = fetch_and_verify_checkpoint(
+            slug,
+            save_path=save,
+            verify_against=verify_against,
+        )
+    except UbuntuBioError as exc:
+        console.print(f"[bold red][AUDIT FAILED][/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[bold green][VERIFIED][/bold green] {res['repo']} | "
+        f"entries={res['entries_checked']} | head={res['head_hash'][:16]}... | "
+        f"kid={res.get('kid')} | anchors_checked={res['anchors_checked']}"
+    )
+    if res.get("saved_to"):
+        console.print(f"[dim]Appended external anchor to {res['saved_to']}[/dim]")
 
 
 def main() -> None:

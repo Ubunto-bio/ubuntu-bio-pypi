@@ -175,7 +175,7 @@ def init_dataset(
     country_clean = country.strip().upper()
     if country_clean not in AU_COUNTRY_CODES:
         raise ClientValidationError(
-            f"Country code '{country}' must belong to the 54 African Union member states."
+            f"Country code '{country}' must belong to the 55 African Union member states."
         )
 
     if taxon_id in PROHIBITED_TAXA:
