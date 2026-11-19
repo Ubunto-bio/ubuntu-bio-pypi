@@ -136,3 +136,75 @@ def test_upload_file_skips_put_when_cas_deduplicated(tmp_path: Path) -> None:
         assert res["status"] == "committed"
         assert mock_put.call_count == 0
         assert mock_post.call_count == 3
+
+
+def test_upload_folder_commits_all_files_atomically(tmp_path: Path) -> None:
+    """upload_folder must upload all blobs and send a single atomic /commit with every file."""
+    import gzip
+
+    folder = tmp_path / "lassa_dataset"
+    reads_dir = folder / "reads"
+    reads_dir.mkdir(parents=True)
+    (folder / "README.md").write_text(
+        """---
+title: "Lassa Rehearsal"
+domain: virus
+access: public
+license: cc-by-4.0
+countries: [GH]
+taxon_ids: [11620]
+sequencing:
+  platform: ILLUMINA
+  instrument_model: "Illumina MiSeq"
+  library_strategy: WGS
+  library_source: GENOMIC
+  library_selection: PCR
+  library_layout: single
+  libraries:
+    - library_id: LIB_01
+      sample_name: S1
+      title: "WGS library for S1"
+      file_type: FASTQ
+      filenames:
+        - reads/S1_R1.fastq.gz
+---
+# Lassa
+"""
+    )
+    (folder / "samples.tsv").write_text(
+        "sample_id\ttaxon_id\tcountry\tcollection_date\tlat\tlon\tadmin1\thost\tisolation_source\n"
+        "S1\t11620\tGH\t2026-10-12\t5.6037\t-0.1870\tGreater Accra\tMastomys natalensis\tswab\n"
+    )
+    seq = "CGCACAGTGGATCCTAGGCATTTGATTGCGCATTTGTCTTGAGAAACCATTG"
+    with gzip.open(reads_dir / "S1_R1.fastq.gz", "wt", encoding="utf-8") as fh:
+        fh.write(f"@S1:1\n{seq}\n+\n{'I' * len(seq)}\n")
+
+    pre_resp = MagicMock()
+    pre_resp.status_code = 200
+    pre_resp.json.return_value = {"cas_write_token": "mock_cas_jwt"}
+
+    batch_resp = MagicMock()
+    batch_resp.status_code = 200
+    batch_resp.json.return_value = {"transfer": "basic", "objects": []}
+
+    commit_resp = MagicMock()
+    commit_resp.status_code = 201
+    commit_resp.json.return_value = {"status": "committed", "repo_slug": "waccbip/lassa"}
+
+    with patch("httpx.post") as mock_post, patch("httpx.put") as mock_put:
+        mock_post.side_effect = [pre_resp, batch_resp, commit_resp]
+        res = upload_folder(
+            repo_id="waccbip/lassa",
+            folder_path=folder,
+            token="ubp_test_token",
+            hub_url="https://api.ubuntubio.org",
+        )
+
+        assert res["status"] == "committed"
+        assert res["files_count"] == 3
+        assert mock_put.call_count == 0
+        # Exactly 3 POSTs total: 1 preupload + 1 LFS batch + 1 atomic commit
+        assert mock_post.call_count == 3
+        commit_call_kwargs = mock_post.call_args_list[2].kwargs
+        committed_paths = sorted(f["path"] for f in commit_call_kwargs["json"]["files"])
+        assert committed_paths == ["README.md", "reads/S1_R1.fastq.gz", "samples.tsv"]

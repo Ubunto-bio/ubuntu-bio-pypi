@@ -215,7 +215,7 @@ def upload_folder(
     hub_url: str | None = None,
     ignore_patterns: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Upload an entire directory of files with preflight schema validation."""
+    """Upload an entire directory of files atomically in a single commit."""
     root_folder = Path(folder_path)
     if not root_folder.is_dir():
         raise NotADirectoryError(f"Specified path '{folder_path}' is not a directory.")
@@ -223,35 +223,142 @@ def upload_folder(
     # 1. Run local preflight metadata checks
     _validate_local_metadata(root_folder)
 
+    owner, name = _split_repo_id(repo_id)
+    base_url = (hub_url or get_hub_url()).rstrip("/")
+    active_token = token or get_token()
+
+    if not active_token:
+        raise AuthenticationError("Authentication required to upload files.")
+
+    headers = {"Authorization": f"Bearer {active_token}"}
     ignored = DEFAULT_IGNORE_PATTERNS | (ignore_patterns or set())
     files_to_upload: list[tuple[Path, str]] = []
 
-    for path in root_folder.rglob("*"):
+    for path in sorted(root_folder.rglob("*")):
         if path.is_file():
-            # Check ignore patterns
             rel_parts = set(path.relative_to(root_folder).parts)
             if rel_parts & ignored:
                 continue
-            rel_path = str(path.relative_to(root_folder))
+            rel_path = path.relative_to(root_folder).as_posix().strip("/")
             files_to_upload.append((path, rel_path))
 
     if not files_to_upload:
         raise UploadError(f"No files found in '{folder_path}' to upload.")
 
-    committed_files: list[str] = []
-    # Upload each file
-    for local_file, repo_rel_path in files_to_upload:
-        upload_file(
-            repo_id=repo_id,
-            path_or_bytes=local_file,
-            path_in_repo=repo_rel_path,
-            branch=branch,
-            message=message or f"Upload folder {root_folder.name}",
-            token=token,
-            hub_url=hub_url,
-        )
-        committed_files.append(repo_rel_path)
+    staged: list[dict[str, Any]] = []
+    content_by_oid: dict[str, bytes] = {}
+    unique_lfs_objects: list[dict[str, Any]] = []
 
+    for local_file, repo_rel_path in files_to_upload:
+        content = local_file.read_bytes()
+        sha256 = _calculate_sha256(content)
+        size_bytes = len(content)
+        staged.append(
+            {
+                "path": repo_rel_path,
+                "sha256": sha256,
+                "xet_hash": sha256,
+                "size_bytes": size_bytes,
+            }
+        )
+        if sha256 not in content_by_oid:
+            content_by_oid[sha256] = content
+            unique_lfs_objects.append({"oid": sha256, "size": size_bytes})
+
+    # 2. Single preupload inquiry for all files
+    try:
+        pre_resp = httpx.post(
+            f"{base_url}/api/repos/{owner}/{name}/preupload",
+            json={"filenames": [entry["path"] for entry in staged]},
+            headers=headers,
+            timeout=20.0,
+        )
+    except httpx.RequestError as exc:
+        raise UploadError(f"Connection error during preupload inquiry: {exc}") from exc
+
+    if pre_resp.status_code == 404:
+        raise RepositoryNotFoundError(f"Repository '{repo_id}' not found.")
+    if pre_resp.status_code == 403:
+        raise AuthorizationError(f"Write permission denied on repository '{repo_id}'.")
+    if pre_resp.status_code != 200:
+        raise UploadError(
+            f"Preupload inquiry failed (status {pre_resp.status_code}): {pre_resp.text}"
+        )
+
+    pre_data = pre_resp.json()
+    cas_token = pre_data["cas_write_token"]
+
+    # 3. Single Git LFS Batch negotiation for all unique objects
+    lfs_req = {
+        "operation": "upload",
+        "transfers": ["basic"],
+        "objects": unique_lfs_objects,
+    }
+    try:
+        batch_resp = httpx.post(
+            f"{base_url}/{owner}/{name}.git/info/lfs/objects/batch",
+            json=lfs_req,
+            headers=headers,
+            timeout=30.0,
+        )
+    except httpx.RequestError as exc:
+        raise UploadError(f"Connection error during LFS batch negotiation: {exc}") from exc
+
+    if batch_resp.status_code != 200:
+        raise UploadError(
+            f"LFS batch negotiation failed (status {batch_resp.status_code}): {batch_resp.text}"
+        )
+
+    batch_data = batch_resp.json()
+    for obj_data in batch_data.get("objects", []):
+        actions = obj_data.get("actions") or {}
+        upload_action = actions.get("upload")
+        if not upload_action:
+            continue
+        oid = str(obj_data["oid"])
+        payload = content_by_oid[oid]
+        upload_url = upload_action["href"]
+        upload_headers = dict(upload_action.get("header", {}))
+        if "Authorization" not in upload_headers:
+            upload_headers["Authorization"] = f"Bearer {cas_token}"
+
+        try:
+            put_resp = httpx.put(
+                upload_url,
+                content=payload,
+                headers=upload_headers,
+                timeout=60.0,
+            )
+        except httpx.RequestError as exc:
+            raise UploadError(f"Connection error transferring object payload: {exc}") from exc
+
+        if put_resp.status_code not in (200, 201):
+            raise UploadError(
+                f"Object upload transfer failed (status {put_resp.status_code}): {put_resp.text}"
+            )
+
+    # 4. Single atomic commit containing all files together (passes two-way file parity)
+    commit_payload = {
+        "branch": branch,
+        "message": message or f"Upload folder {root_folder.name}",
+        "files": staged,
+    }
+    try:
+        commit_resp = httpx.post(
+            f"{base_url}/api/repos/{owner}/{name}/commit",
+            json=commit_payload,
+            headers=headers,
+            timeout=60.0,
+        )
+    except httpx.RequestError as exc:
+        raise UploadError(f"Connection error registering commit: {exc}") from exc
+
+    if commit_resp.status_code != 201:
+        raise UploadError(
+            f"Commit registration failed (status {commit_resp.status_code}): {commit_resp.text}"
+        )
+
+    committed_files = [str(entry["path"]) for entry in staged]
     return {
         "status": "committed",
         "repo_slug": repo_id,

@@ -226,11 +226,11 @@ def login(
             # Build visual panel
             panel_text = render_ascii_banner()
             panel_text.append(
-                "\n  🌍 African Sovereign Bioinformatics Data Hub\n",
+                "\n  African Sovereign Bioinformatics Data Hub\n",
                 style="bold white",
             )
             panel_text.append(
-                "  Genomic Intelligence & Pathogen Surveillance across 54 AU Member States\n\n",
+                "  Genomic Intelligence & Pathogen Surveillance across 55 AU Member States\n\n",
                 style="dim #9ca3af",
             )
             panel_text.append("  [1] Authorize in Browser:\n", style="bold white")
@@ -310,7 +310,7 @@ def login(
         success_text.append("  Token Path:  ", style="bold #9ca3af")
         success_text.append("~/.config/ubuntubio/token\n", style="dim")
         success_text.append("  Status:      ", style="bold #9ca3af")
-        success_text.append("● Sovereign Verified (54 AU States)\n", style="bold #00ed64")
+        success_text.append("● Sovereign Verified (55 AU States)\n", style="bold #00ed64")
 
         success_panel = Panel(
             success_text,
@@ -405,7 +405,11 @@ def create(
     ] = "public",
     description: Annotated[
         str | None,
-        typer.Option("--desc", help="Brief scientific abstract or description of the dataset."),
+        typer.Option(
+            "--desc",
+            "--description",
+            help="Brief scientific abstract or description of the dataset.",
+        ),
     ] = None,
     license: Annotated[
         str,

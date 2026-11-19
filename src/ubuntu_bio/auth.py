@@ -198,7 +198,7 @@ SUCCESS_CALLBACK_HTML = """<!DOCTYPE html>
     <p style="color: #6b7280; font-size: 0.85rem;">
       You can now safely close this browser window and return to your terminal.
     </p>
-    <div class="tag">● Sovereign Verified (54 AU States)</div>
+    <div class="tag">● Sovereign Verified (55 AU States)</div>
   </div>
 </body>
 </html>
