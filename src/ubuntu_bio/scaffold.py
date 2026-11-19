@@ -135,13 +135,7 @@ def generate_samples_tsv_template(
 
 def generate_remote_files_template() -> str:
     """Generate remote_files.tsv template for external fastq mirrors."""
-    return (
-        "# Remote sequence file manifest (optional)\n"
-        "# Format: filename<tab>url<tab>md5<tab>size_bytes\n"
-        "filename\turl\tmd5\tsize_bytes\n"
-        "# reads/sample_1.fastq.gz\thttps://ftp.sra.ebi.ac.uk/sample_1.fastq.gz\t"
-        "d41d8cd98f00b204e9800998ecf8427e\t1048576\n"
-    )
+    return "filename\turl\tmd5\tsize_bytes\n"
 
 
 def init_dataset(
