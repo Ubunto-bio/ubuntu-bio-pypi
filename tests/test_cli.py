@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+from ubuntu_bio import __version__
 from ubuntu_bio.cli import app
 
 runner = CliRunner()
@@ -14,7 +15,7 @@ def test_cli_version() -> None:
     """Test ubio --version prints version string."""
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "UbuntuBio CLI version: 1.0.0" in result.stdout
+    assert f"UbuntuBio CLI version: {__version__}" in result.stdout
 
 
 def test_cli_whoami_success() -> None:
